@@ -1,96 +1,262 @@
 import { Room, Client } from "@colyseus/core";
 import { Schema, MapSchema, ArraySchema, type } from "@colyseus/schema";
 
+// ─── Config ──────────────────────────────────────────────
+const GRID_WIDTH = 30;
+const GRID_HEIGHT = 20;
+const SHIP_SPAWN_COL = 1;
+const DOCK_COL = GRID_WIDTH - 2; // column 28
+const SHIP_SPEED = 1 / 1.5; // tiles per second (1 tile every 1.5s)
+
+type Direction = "up" | "down" | "left" | "right";
+const OPPOSITE: Record<Direction, Direction> = {
+  up: "down",
+  down: "up",
+  left: "right",
+  right: "left",
+};
+const DELTA: Record<Direction, { dx: number; dy: number }> = {
+  up: { dx: 0, dy: -1 },
+  down: { dx: 0, dy: 1 },
+  left: { dx: -1, dy: 0 },
+  right: { dx: 1, dy: 0 },
+};
+
+// ─── Schema ──────────────────────────────────────────────
 class Player extends Schema {
-  @type("number") x: number = 0;
+  @type("number") x: number = 0; // tile coordinates, not pixels
   @type("number") y: number = 0;
+  @type("string") facing: Direction = "down";
   @type("string") name: string = "";
-  @type("boolean") carryingDirt: boolean = false;
+  // "carrying" is either "" (nothing), "dirt" (freshly dug or picked up pile) — same representation either way
+  @type("boolean") carrying: boolean = false;
 }
 
 class Tile extends Schema {
-  @type("boolean") dug: boolean = false;
+  // "ground" | "river" | tile can also have a dirt pile ON TOP of either
+  @type("string") terrain: "ground" | "river" = "ground";
+  @type("boolean") hasDirtPile: boolean = false;
 }
 
 class GameState extends Schema {
   @type({ map: Player }) players = new MapSchema<Player>();
-  @type([Tile]) tiles = new ArraySchema<Tile>();
-  @type("number") shipPosition: number = 0;
-  @type("boolean") crashed: boolean = false;
-  @type("number") dirtDelivered: number = 0;
+  @type([Tile]) tiles = new ArraySchema<Tile>(); // flat array, index = y * GRID_WIDTH + x
 
-  gridWidth: number = 20;
+  @type("number") shipX: number = 0; // continuous world position, in tile units (can be fractional)
+  @type("number") shipY: number = 0;
+  @type("string") shipFacing: Direction = "right";
+  @type("string") shipSignal: string = ""; // pending turn signal: "" | "up" | "down" | "left" | "right"
+  @type("boolean") crashed: boolean = false;
+  @type("boolean") won: boolean = false;
+
+  dockX: number = 0;
+  dockY: number = 0;
 }
 
 export class GameRoom extends Room {
-  maxClients = 4;
+  maxClients = 5; // design: up to 5 players
   state = new GameState();
-  private shipInterval!: any;
-
-  // Dump zone: a fixed x-range on the walkway where players can unload dirt
-  private readonly DUMP_ZONE_MIN_X = 700;
-  private readonly DUMP_ZONE_MAX_X = 780;
+  private shipLoopHandle: any;
 
   onCreate() {
-    for (let i = 0; i < this.state.gridWidth; i++) {
-      const tile = new Tile();
-      tile.dug = i === 0;
-      this.state.tiles.push(tile);
+    this.initGrid();
+    this.initShipAndDock();
+    this.registerMessageHandlers();
+    this.startShipLoop();
+  }
+
+  // ─── Setup ──────────────────────────────────────────────
+
+  private tileIndex(x: number, y: number): number {
+    return y * GRID_WIDTH + x;
+  }
+
+  private tileAt(x: number, y: number): Tile | undefined {
+    if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) return undefined;
+    return this.state.tiles[this.tileIndex(x, y)];
+  }
+
+  private initGrid() {
+    for (let y = 0; y < GRID_HEIGHT; y++) {
+      for (let x = 0; x < GRID_WIDTH; x++) {
+        const tile = new Tile();
+        // Design: outer 1-tile ring is border — we just leave it as "ground"
+        // and simply never let the ship path start/end there. Players CAN
+        // walk near it; it's non-functional, not physically special.
+        this.state.tiles.push(tile);
+      }
     }
+  }
 
-    this.onMessage("move", (client, data: { x: number; y: number }) => {
+  private initShipAndDock() {
+    // Design: ship & dock rows are independently random within [5, 14]
+    const shipRow = 5 + Math.floor(Math.random() * 10);
+    const dockRow = 5 + Math.floor(Math.random() * 10);
+
+    this.state.shipX = SHIP_SPAWN_COL;
+    this.state.shipY = shipRow;
+    this.state.shipFacing = "right";
+
+    this.state.dockX = DOCK_COL;
+    this.state.dockY = dockRow;
+
+    // Design: head start — 3 tiles ahead of the ship's spawn are pre-dug
+    for (let i = 1; i <= 3; i++) {
+      const tile = this.tileAt(SHIP_SPAWN_COL + i, shipRow);
+      if (tile) tile.terrain = "river";
+    }
+    // The ship's own starting tile counts as passable too
+    const startTile = this.tileAt(SHIP_SPAWN_COL, shipRow);
+    if (startTile) startTile.terrain = "river";
+  }
+
+  // ─── Player actions ─────────────────────────────────────
+
+  private registerMessageHandlers() {
+    this.onMessage("move", (client, data: { x: number; y: number; facing: Direction }) => {
       const player = this.state.players.get(client.sessionId);
-      if (player) {
-        player.x = data.x;
-        player.y = data.y;
+      if (!player) return;
+      // NOTE: client-authoritative position for now (same simplification as
+      // the earlier prototype) — server currently trusts the client's x/y.
+      // A hardening pass later would validate steps server-side instead.
+      player.x = data.x;
+      player.y = data.y;
+      player.facing = data.facing;
+    });
+
+    // Dig: player faces a ground tile, not carrying anything -> becomes river, player now carries dirt
+    this.onMessage("dig", (client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || player.carrying) return;
+
+      const target = this.facingTile(player);
+      if (target && target.terrain === "ground" && !target.hasDirtPile) {
+        target.terrain = "river";
+        player.carrying = true;
       }
     });
 
-    // Dig a tile — only allowed if not already carrying dirt
-    this.onMessage("dig", (client, data: { tileIndex: number }) => {
-      if (this.state.crashed) return;
-      const player = this.state.players.get(client.sessionId);
-      const tile = this.state.tiles[data.tileIndex];
-
-      if (player && tile && !tile.dug && !player.carryingDirt) {
-        tile.dug = true;
-        player.carryingDirt = true;
-      }
-    });
-
-    // Dump dirt — only allowed if carrying dirt AND standing in the dump zone
+    // Dump: player carrying dirt, faces an empty tile (no pile already there)
     this.onMessage("dump", (client) => {
       const player = this.state.players.get(client.sessionId);
-      if (!player || !player.carryingDirt) return;
+      if (!player || !player.carrying) return;
 
-      if (player.x >= this.DUMP_ZONE_MIN_X && player.x <= this.DUMP_ZONE_MAX_X) {
-        player.carryingDirt = false;
-        this.state.dirtDelivered++;
+      const target = this.facingTile(player);
+      if (!target || target.hasDirtPile) return; // can't dump on existing pile
+
+      if (target.terrain === "ground") {
+        // Design: dumping dirt onto ground creates a pile (new obstacle)
+        target.hasDirtPile = true;
+      } else if (target.terrain === "river") {
+        // Design: dumping dirt back into a dug river fills it back to ground
+        target.terrain = "ground";
+      }
+      player.carrying = false;
+    });
+
+    // Pick up an existing dirt pile to relocate it
+    this.onMessage("pickup", (client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || player.carrying) return;
+
+      const target = this.facingTile(player);
+      if (target && target.hasDirtPile) {
+        target.hasDirtPile = false;
+        player.carrying = true;
       }
     });
 
-    this.clock.setTimeout(() => {
-      this.shipInterval = this.clock.setInterval(() => {
-        if (this.state.crashed) return;
+    // Turn signal: only perpendicular turns are valid; opposite direction rejected
+    this.onMessage("signal", (client, data: { direction: Direction }) => {
+      const requested = data.direction;
+      const current = this.state.shipFacing as Direction;
 
-        const nextIndex = this.state.shipPosition + 1;
-        const nextTile = this.state.tiles[nextIndex];
+      if (requested === current) return; // already going that way, no-op
+      if (requested === OPPOSITE[current]) return; // design rule: can't signal a reverse
 
-        if (!nextTile || !nextTile.dug) {
-          this.state.crashed = true;
-          return;
-        }
-
-        this.state.shipPosition = nextIndex;
-      }, 2000);
-    }, 3000);
+      this.state.shipSignal = requested;
+    });
   }
+
+  private facingTile(player: Player): Tile | undefined {
+    const delta = DELTA[player.facing as Direction];
+    // Player x/y are stored in tile units (see NOTE in "move" handler);
+    // "facing tile" is simply one tile-step from their current position.
+    const targetX = Math.round(player.x) + delta.dx;
+    const targetY = Math.round(player.y) + delta.dy;
+    return this.tileAt(targetX, targetY);
+  }
+
+  // ─── Ship loop ──────────────────────────────────────────
+
+  private startShipLoop() {
+    // Runs frequently (small time steps) so movement is smooth/continuous
+    // rather than tile-by-tile hopping, per design.
+    const TICK_MS = 50;
+    this.shipLoopHandle = this.clock.setInterval(() => {
+      if (this.state.crashed || this.state.won) return;
+      this.advanceShip(TICK_MS / 1000);
+    }, TICK_MS);
+  }
+
+  private advanceShip(deltaSeconds: number) {
+    const distance = SHIP_SPEED * deltaSeconds;
+    const facing = this.state.shipFacing as Direction;
+    const delta = DELTA[facing];
+
+    // The tile the ship is currently moving toward (its leading edge)
+    const targetTileX = Math.round(this.state.shipX) + delta.dx;
+    const targetTileY = Math.round(this.state.shipY) + delta.dy;
+
+    // Check for a pending turn signal — take it if the perpendicular tile is river
+    if (this.state.shipSignal) {
+      const signalDir = this.state.shipSignal as Direction;
+      const signalDelta = DELTA[signalDir];
+      const signalTileX = Math.round(this.state.shipX) + signalDelta.dx;
+      const signalTileY = Math.round(this.state.shipY) + signalDelta.dy;
+      const signalTile = this.tileAt(signalTileX, signalTileY);
+
+      // Only actually turn once the ship is centered-ish on a tile (avoids
+      // turning mid-tile in a way that looks like teleporting sideways)
+      const nearCenter =
+        Math.abs(this.state.shipX - Math.round(this.state.shipX)) < 0.05 &&
+        Math.abs(this.state.shipY - Math.round(this.state.shipY)) < 0.05;
+
+      if (signalTile && signalTile.terrain === "river" && nearCenter) {
+        this.state.shipFacing = signalDir;
+        this.state.shipSignal = "";
+        return; // turned this tick; move normally next tick
+      }
+    }
+
+    const targetTile = this.tileAt(targetTileX, targetTileY);
+    if (!targetTile || targetTile.terrain !== "river") {
+      // Design: crash only happens when trying to advance into a non-river tile
+      this.state.crashed = true;
+      return;
+    }
+
+    this.state.shipX += delta.dx * distance;
+    this.state.shipY += delta.dy * distance;
+
+    // Win check: close enough to the dock tile
+    const distToDock = Math.hypot(
+      this.state.shipX - this.state.dockX,
+      this.state.shipY - this.state.dockY
+    );
+    if (distToDock < 0.5) {
+      this.state.won = true;
+    }
+  }
+
+  // ─── Lifecycle ──────────────────────────────────────────
 
   onJoin(client: Client, options: { name?: string }) {
     const player = new Player();
     player.name = options?.name || `Player-${client.sessionId.slice(0, 4)}`;
-    player.x = 20;
-    player.y = 380; // walkway, below the track row
+    // Spawn players near the ship's start so they're not lost in a big empty grid
+    player.x = SHIP_SPAWN_COL;
+    player.y = Math.min(GRID_HEIGHT - 2, this.state.shipY + 2);
     this.state.players.set(client.sessionId, player);
   }
 
@@ -99,6 +265,6 @@ export class GameRoom extends Room {
   }
 
   onDispose() {
-    this.shipInterval?.clear();
+    this.shipLoopHandle?.clear();
   }
 }
