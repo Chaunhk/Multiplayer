@@ -6,12 +6,5 @@ new Phaser.Game({
   width: 800,
   height: 600,
   parent: "game",
-  physics: {
-    default: "arcade",
-    arcade: {
-      gravity: { x: 0, y: 800 },
-      debug: false,
-    },
-  },
   scene: [MainScene],
 });

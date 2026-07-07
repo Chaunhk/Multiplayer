@@ -5,6 +5,7 @@ class Player extends Schema {
   @type("number") x: number = 0;
   @type("number") y: number = 0;
   @type("string") name: string = "";
+  @type("boolean") carryingDirt: boolean = false;
 }
 
 class Tile extends Schema {
@@ -14,8 +15,9 @@ class Tile extends Schema {
 class GameState extends Schema {
   @type({ map: Player }) players = new MapSchema<Player>();
   @type([Tile]) tiles = new ArraySchema<Tile>();
-  @type("number") shipPosition: number = 0; // index into tiles array
+  @type("number") shipPosition: number = 0;
   @type("boolean") crashed: boolean = false;
+  @type("number") dirtDelivered: number = 0;
 
   gridWidth: number = 20;
 }
@@ -25,52 +27,70 @@ export class GameRoom extends Room {
   state = new GameState();
   private shipInterval!: any;
 
+  // Dump zone: a fixed x-range on the walkway where players can unload dirt
+  private readonly DUMP_ZONE_MIN_X = 700;
+  private readonly DUMP_ZONE_MAX_X = 780;
+
   onCreate() {
-  for (let i = 0; i < this.state.gridWidth; i++) {
-    const tile = new Tile();
-    tile.dug = i === 0;
-    this.state.tiles.push(tile);
-  }
-
-  this.onMessage("move", (client, data: { x: number; y: number }) => {
-    const player = this.state.players.get(client.sessionId);
-    if (player) {
-      player.x = data.x;
-      player.y = data.y;
+    for (let i = 0; i < this.state.gridWidth; i++) {
+      const tile = new Tile();
+      tile.dug = i === 0;
+      this.state.tiles.push(tile);
     }
-  });
 
-  this.onMessage("dig", (client, data: { tileIndex: number }) => {
-    if (this.state.crashed) return;
-    const tile = this.state.tiles[data.tileIndex];
-    if (tile) {
-      tile.dug = true;
-    }
-  });
-
-  // Give players 3 seconds before the ship starts moving
-  this.clock.setTimeout(() => {
-    this.shipInterval = this.clock.setInterval(() => {
-      if (this.state.crashed) return;
-
-      const nextIndex = this.state.shipPosition + 1;
-      const nextTile = this.state.tiles[nextIndex];
-
-      if (!nextTile || !nextTile.dug) {
-        this.state.crashed = true;
-        return;
+    this.onMessage("move", (client, data: { x: number; y: number }) => {
+      const player = this.state.players.get(client.sessionId);
+      if (player) {
+        player.x = data.x;
+        player.y = data.y;
       }
+    });
 
-      this.state.shipPosition = nextIndex;
-    }, 2000); // ship moves every 2 seconds instead of 1
-  }, 3000);
-}
+    // Dig a tile — only allowed if not already carrying dirt
+    this.onMessage("dig", (client, data: { tileIndex: number }) => {
+      if (this.state.crashed) return;
+      const player = this.state.players.get(client.sessionId);
+      const tile = this.state.tiles[data.tileIndex];
+
+      if (player && tile && !tile.dug && !player.carryingDirt) {
+        tile.dug = true;
+        player.carryingDirt = true;
+      }
+    });
+
+    // Dump dirt — only allowed if carrying dirt AND standing in the dump zone
+    this.onMessage("dump", (client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.carryingDirt) return;
+
+      if (player.x >= this.DUMP_ZONE_MIN_X && player.x <= this.DUMP_ZONE_MAX_X) {
+        player.carryingDirt = false;
+        this.state.dirtDelivered++;
+      }
+    });
+
+    this.clock.setTimeout(() => {
+      this.shipInterval = this.clock.setInterval(() => {
+        if (this.state.crashed) return;
+
+        const nextIndex = this.state.shipPosition + 1;
+        const nextTile = this.state.tiles[nextIndex];
+
+        if (!nextTile || !nextTile.dug) {
+          this.state.crashed = true;
+          return;
+        }
+
+        this.state.shipPosition = nextIndex;
+      }, 2000);
+    }, 3000);
+  }
 
   onJoin(client: Client, options: { name?: string }) {
     const player = new Player();
     player.name = options?.name || `Player-${client.sessionId.slice(0, 4)}`;
     player.x = 20;
-    player.y = 350; // just below the track row
+    player.y = 380; // walkway, below the track row
     this.state.players.set(client.sessionId, player);
   }
 
