@@ -1,48 +1,87 @@
 import Phaser from "phaser";
 import { Client, Room, getStateCallbacks } from "@colyseus/sdk";
 
-const TILE_SIZE = 40;
-const GRID_WIDTH = 20;
-const ROW_Y = 300;
-const WALKWAY_Y = 380;
-const DUMP_ZONE_MIN_X = 700;
-const DUMP_ZONE_MAX_X = 780;
+// ─── Config (mirrors server) ────────────────────────────
+const TILE_SIZE = 24; // pixels per tile — smaller since grid is now 30x20
+const GRID_WIDTH = 30;
+const GRID_HEIGHT = 20;
+
+type Direction = "up" | "down" | "left" | "right";
+const DELTA: Record<Direction, { dx: number; dy: number }> = {
+  up: { dx: 0, dy: -1 },
+  down: { dx: 0, dy: 1 },
+  left: { dx: -1, dy: 0 },
+  right: { dx: 1, dy: 0 },
+};
 
 export class MainScene extends Phaser.Scene {
   private room!: Room;
   private mySessionId = "";
+
   private localPlayer!: Phaser.GameObjects.Rectangle;
+  private myFacing: Direction = "down";
+  private myCarrying = false;
+
   private remotePlayers: Map<string, Phaser.GameObjects.Rectangle> = new Map();
-  private tileRects: Phaser.GameObjects.Rectangle[] = [];
+  private tileRects: Phaser.GameObjects.Rectangle[] = []; // index = y * GRID_WIDTH + x
+  private dirtPileMarkers: Phaser.GameObjects.Arc[] = [];
   private ship!: Phaser.GameObjects.Triangle;
+  private dockMarker!: Phaser.GameObjects.Star;
+
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
+  private wKey!: Phaser.Input.Keyboard.Key;
+  private aKey!: Phaser.Input.Keyboard.Key;
+  private sKey!: Phaser.Input.Keyboard.Key;
+  private dKey!: Phaser.Input.Keyboard.Key;
+  private digKey!: Phaser.Input.Keyboard.Key; // Space: dig / dump (context-sensitive)
+  private pickupKey!: Phaser.Input.Keyboard.Key; // E: pick up a dirt pile
+  private flagKey!: Phaser.Input.Keyboard.Key; // Ctrl: hold to enter signal mode
+
   private statusText!: Phaser.GameObjects.Text;
   private carryingText!: Phaser.GameObjects.Text;
-  private crashed = false;
-  private isCarrying = false;
 
   constructor() {
     super("MainScene");
   }
 
   async create() {
-    this.add.rectangle(400, 300, 800, 600, 0x1a1a2e);
+    // Background
+    this.add.rectangle(
+      (GRID_WIDTH * TILE_SIZE) / 2,
+      (GRID_HEIGHT * TILE_SIZE) / 2,
+      GRID_WIDTH * TILE_SIZE,
+      GRID_HEIGHT * TILE_SIZE,
+      0x1a1a2e
+    );
 
     this.cursors = this.input.keyboard!.createCursorKeys();
-    const spaceKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+    this.wKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.W);
+    this.aKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.A);
+    this.sKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.S);
+    this.dKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.D);
+    this.digKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+    this.pickupKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+    this.flagKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.CTRL);
 
-    this.statusText = this.add.text(10, 10, "", { fontSize: "20px", color: "#ffffff" });
-    this.carryingText = this.add.text(10, 35, "", { fontSize: "16px", color: "#ffcc00" });
+    this.statusText = this.add.text(10, 10, "", { fontSize: "18px", color: "#ffffff" });
+    this.carryingText = this.add.text(10, 30, "", { fontSize: "14px", color: "#ffcc00" });
 
-    this.add.rectangle(
-      (DUMP_ZONE_MIN_X + DUMP_ZONE_MAX_X) / 2,
-      WALKWAY_Y,
-      DUMP_ZONE_MAX_X - DUMP_ZONE_MIN_X,
-      40,
-      0x555555,
-      0.5
-    ).setStrokeStyle(2, 0xffffff);
-    this.add.text(DUMP_ZONE_MIN_X + 5, WALKWAY_Y - 30, "DUMP", { fontSize: "14px", color: "#ffffff" });
+    // Draw the tile grid once (visuals get updated as state changes)
+    for (let y = 0; y < GRID_HEIGHT; y++) {
+      for (let x = 0; x < GRID_WIDTH; x++) {
+        const rect = this.add.rectangle(
+          x * TILE_SIZE + TILE_SIZE / 2,
+          y * TILE_SIZE + TILE_SIZE / 2,
+          TILE_SIZE - 1,
+          TILE_SIZE - 1,
+          0x8b5a2b // ground = brown
+        );
+        this.tileRects.push(rect);
+        this.dirtPileMarkers.push(
+          this.add.circle(rect.x, rect.y, TILE_SIZE / 4, 0x4a3418).setVisible(false)
+        );
+      }
+    }
 
     const client = new Client("ws://localhost:2567");
     this.room = await client.joinOrCreate("game_room", { name: "Player" });
@@ -50,52 +89,57 @@ export class MainScene extends Phaser.Scene {
 
     const $ = getStateCallbacks(this.room);
 
-    for (let i = 0; i < GRID_WIDTH; i++) {
-      const rect = this.add.rectangle(
-        i * TILE_SIZE + TILE_SIZE / 2,
-        ROW_Y,
-        TILE_SIZE - 2,
-        TILE_SIZE - 2,
-        0x8b5a2b
-      ).setStrokeStyle(1, 0x000000);
-      this.tileRects.push(rect);
-    }
-
-    this.ship = this.add.triangle(TILE_SIZE / 2, ROW_Y, 0, 20, 20, -20, -20, -20, 0x00ffff);
-
+    // Tiles
     $(this.room.state).tiles.onAdd((tile, index) => {
-      this.updateTileVisual(index, tile.dug);
-      $(tile).onChange(() => this.updateTileVisual(index, tile.dug));
+      this.updateTileVisual(index, tile.terrain, tile.hasDirtPile);
+      $(tile).onChange(() => this.updateTileVisual(index, tile.terrain, tile.hasDirtPile));
     });
 
-    $(this.room.state).listen("shipPosition", (value: number) => {
-      this.ship.x = value * TILE_SIZE + TILE_SIZE / 2;
+    // Ship — a triangle pointing in its facing direction
+    this.ship = this.add.triangle(0, 0, 0, 12, 12, -12, -12, -12, 0x00ffff);
+    $(this.room.state).listen("shipX", (v: number) => (this.ship.x = v * TILE_SIZE + TILE_SIZE / 2));
+    $(this.room.state).listen("shipY", (v: number) => (this.ship.y = v * TILE_SIZE + TILE_SIZE / 2));
+    $(this.room.state).listen("shipFacing", (v: string) => this.rotateShip(v as Direction));
+
+    // Dock marker
+    this.dockMarker = this.add.star(0, 0, 5, 6, 12, 0xffcc00);
+    // dockX/dockY are plain fields, not @type-synced — read once from initial state
+    this.dockMarker.x = (this.room.state as any).dockX * TILE_SIZE + TILE_SIZE / 2;
+    this.dockMarker.y = (this.room.state as any).dockY * TILE_SIZE + TILE_SIZE / 2;
+
+    $(this.room.state).listen("crashed", (v: boolean) => {
+      if (v) {
+        this.statusText.setText("💥 SHIP CRASHED! Game Over.");
+        this.ship.setFillStyle(0xff0000);
+      }
+    });
+    $(this.room.state).listen("won", (v: boolean) => {
+      if (v) this.statusText.setText("🎉 Ship reached the dock — you win!");
     });
 
-    $(this.room.state).listen("crashed", (value: boolean) => {
-      this.crashed = value;
-      this.statusText.setText(value ? "💥 SHIP CRASHED! Game Over." : "Dig ahead, dump at DUMP zone!");
-      if (value) this.ship.setFillStyle(0xff0000);
-    });
-
-    $(this.room.state).listen("dirtDelivered", (value: number) => {});
-
+    // Players
     $(this.room.state).players.onAdd((player, sessionId) => {
       const color = sessionId === this.mySessionId ? 0x00ff00 : 0xffff00;
-      const rect = this.add.rectangle(player.x, player.y, 24, 24, color);
+      const rect = this.add.rectangle(
+        player.x * TILE_SIZE + TILE_SIZE / 2,
+        player.y * TILE_SIZE + TILE_SIZE / 2,
+        TILE_SIZE - 4,
+        TILE_SIZE - 4,
+        color
+      );
 
       if (sessionId === this.mySessionId) {
         this.localPlayer = rect;
-        $(player).listen("carryingDirt", (value: boolean) => {
-          this.isCarrying = value;
-          this.carryingText.setText(value ? "🟫 Carrying dirt — go dump it!" : "");
-          rect.setFillStyle(value ? 0x8b5a2b : 0x00ff00);
+        $(player).listen("carrying", (v: boolean) => {
+          this.myCarrying = v;
+          this.carryingText.setText(v ? "🟫 Carrying dirt" : "");
+          rect.setFillStyle(v ? 0x8b5a2b : 0x00ff00);
         });
       } else {
         this.remotePlayers.set(sessionId, rect);
         $(player).onChange(() => {
-          rect.x = player.x;
-          rect.y = player.y;
+          rect.x = player.x * TILE_SIZE + TILE_SIZE / 2;
+          rect.y = player.y * TILE_SIZE + TILE_SIZE / 2;
         });
       }
     });
@@ -105,45 +149,69 @@ export class MainScene extends Phaser.Scene {
       this.remotePlayers.delete(sessionId);
     });
 
-    spaceKey.on("down", () => {
-      if (this.crashed || !this.localPlayer) return;
-
-      if (this.isCarrying) {
-        this.room.send("dump");
-      } else {
-        const tileIndex = Math.floor(this.localPlayer.x / TILE_SIZE);
-        this.room.send("dig", { tileIndex });
-      }
+    // ─── Action keys (dig/dump/pickup context-sensitive) ───
+    this.digKey.on("down", () => {
+      if (!this.localPlayer) return;
+      this.room.send(this.myCarrying ? "dump" : "dig");
     });
+
+    this.pickupKey.on("down", () => {
+      if (!this.localPlayer || this.myCarrying) return;
+      this.room.send("pickup");
+    });
+
+    // ─── Signal mode: hold Ctrl + press a direction ────────
+    const sendSignal = (direction: Direction) => {
+      if (this.flagKey.isDown) {
+        this.room.send("signal", { direction });
+      }
+    };
+    this.cursors.up.on("down", () => sendSignal("up"));
+    this.cursors.down.on("down", () => sendSignal("down"));
+    this.cursors.left.on("down", () => sendSignal("left"));
+    this.cursors.right.on("down", () => sendSignal("right"));
   }
 
-  private updateTileVisual(index: number, dug: boolean) {
+  private rotateShip(facing: Direction) {
+    const angles: Record<Direction, number> = { right: 0, down: 90, left: 180, up: 270 };
+    this.ship.setAngle(angles[facing]);
+  }
+
+  private updateTileVisual(index: number, terrain: string, hasDirtPile: boolean) {
     const rect = this.tileRects[index];
-    if (rect) {
-      rect.setFillStyle(dug ? 0x3399ff : 0x8b5a2b);
-    }
+    const pile = this.dirtPileMarkers[index];
+    if (rect) rect.setFillStyle(terrain === "river" ? 0x3399ff : 0x8b5a2b);
+    if (pile) pile.setVisible(hasDirtPile);
   }
 
   update() {
     if (!this.room || !this.localPlayer) return;
 
-    const speed = 3;
+    // While holding the flag key, movement keys are reserved for signaling —
+    // don't also move the player during that (per design: flag mode is a
+    // distinct mode, not simultaneous movement).
+    if (this.flagKey.isDown) return;
+
+    const speed = 0.08; // tiles per frame-ish, tuned for feel
     let dx = 0;
     let dy = 0;
+    let newFacing: Direction | null = null;
 
-    if (this.cursors.left.isDown) dx = -speed;
-    else if (this.cursors.right.isDown) dx = speed;
+    if (this.cursors.left.isDown || this.aKey.isDown) { dx = -speed; newFacing = "left"; }
+    else if (this.cursors.right.isDown || this.dKey.isDown) { dx = speed; newFacing = "right"; }
 
-    if (this.cursors.up.isDown) dy = -speed;
-    else if (this.cursors.down.isDown) dy = speed;
+    if (this.cursors.up.isDown || this.wKey.isDown) { dy = -speed; newFacing = "up"; }
+    else if (this.cursors.down.isDown || this.sKey.isDown) { dy = speed; newFacing = "down"; }
 
     if (dx !== 0 || dy !== 0) {
-      const newX = this.localPlayer.x + dx;
-      const newY = this.localPlayer.y + dy;
-      const clampedY = Phaser.Math.Clamp(newY, ROW_Y + 25, WALKWAY_Y + 100);
-      this.localPlayer.x = newX;
-      this.localPlayer.y = clampedY;
-      this.room.send("move", { x: this.localPlayer.x, y: this.localPlayer.y });
+      const tileX = this.localPlayer.x / TILE_SIZE + dx;
+      const tileY = this.localPlayer.y / TILE_SIZE + dy;
+
+      this.localPlayer.x = tileX * TILE_SIZE;
+      this.localPlayer.y = tileY * TILE_SIZE;
+      if (newFacing) this.myFacing = newFacing;
+
+      this.room.send("move", { x: tileX, y: tileY, facing: this.myFacing });
     }
   }
 }
