@@ -6,7 +6,7 @@ const GRID_WIDTH = 30;
 const GRID_HEIGHT = 20;
 const SHIP_SPAWN_COL = 1;
 const DOCK_COL = GRID_WIDTH - 2; // column 28
-const SHIP_SPEED = 1 / 1.5; // tiles per second (1 tile every 1.5s)
+const SHIP_SPEED = 0.5 / 1.5; // tiles per second (1 tile every 1.5s)
 
 type Direction = "up" | "down" | "left" | "right";
 const OPPOSITE: Record<Direction, Direction> = {
@@ -49,8 +49,8 @@ class GameState extends Schema {
   @type("boolean") crashed: boolean = false;
   @type("boolean") won: boolean = false;
 
-  dockX: number = 0;
-  dockY: number = 0;
+  @type("number") dockX: number = 0;
+  @type("number") dockY: number = 0;
 }
 
 export class GameRoom extends Room {
@@ -113,16 +113,19 @@ export class GameRoom extends Room {
   // ─── Player actions ─────────────────────────────────────
 
   private registerMessageHandlers() {
-    this.onMessage("move", (client, data: { x: number; y: number; facing: Direction }) => {
-      const player = this.state.players.get(client.sessionId);
-      if (!player) return;
-      // NOTE: client-authoritative position for now (same simplification as
-      // the earlier prototype) — server currently trusts the client's x/y.
-      // A hardening pass later would validate steps server-side instead.
-      player.x = data.x;
-      player.y = data.y;
-      player.facing = data.facing;
-    });
+    this.onMessage(
+      "move",
+      (client, data: { x: number; y: number; facing: Direction }) => {
+        const player = this.state.players.get(client.sessionId);
+        if (!player) return;
+        // NOTE: client-authoritative position for now (same simplification as
+        // the earlier prototype) — server currently trusts the client's x/y.
+        // A hardening pass later would validate steps server-side instead.
+        player.x = data.x;
+        player.y = data.y;
+        player.facing = data.facing;
+      },
+    );
 
     // Dig: player faces a ground tile, not carrying anything -> becomes river, player now carries dirt
     this.onMessage("dig", (client) => {
@@ -205,15 +208,27 @@ export class GameRoom extends Room {
     const delta = DELTA[facing];
 
     // The tile the ship is currently moving toward (its leading edge)
-    const targetTileX = Math.round(this.state.shipX) + delta.dx;
-    const targetTileY = Math.round(this.state.shipY) + delta.dy;
+    const currentTileX =
+      delta.dx > 0
+        ? Math.floor(this.state.shipX)
+        : delta.dx < 0
+          ? Math.ceil(this.state.shipX)
+          : Math.round(this.state.shipX);
+    const currentTileY =
+      delta.dy > 0
+        ? Math.floor(this.state.shipY)
+        : delta.dy < 0
+          ? Math.ceil(this.state.shipY)
+          : Math.round(this.state.shipY);
+    const targetTileX = currentTileX + delta.dx;
+    const targetTileY = currentTileY + delta.dy;
 
     // Check for a pending turn signal — take it if the perpendicular tile is river
     if (this.state.shipSignal) {
       const signalDir = this.state.shipSignal as Direction;
       const signalDelta = DELTA[signalDir];
-      const signalTileX = Math.round(this.state.shipX) + signalDelta.dx;
-      const signalTileY = Math.round(this.state.shipY) + signalDelta.dy;
+      const signalTileX = currentTileX + signalDelta.dx;
+      const signalTileY = currentTileY + signalDelta.dy;
       const signalTile = this.tileAt(signalTileX, signalTileY);
 
       // Only actually turn once the ship is centered-ish on a tile (avoids
@@ -242,7 +257,7 @@ export class GameRoom extends Room {
     // Win check: close enough to the dock tile
     const distToDock = Math.hypot(
       this.state.shipX - this.state.dockX,
-      this.state.shipY - this.state.dockY
+      this.state.shipY - this.state.dockY,
     );
     if (distToDock < 0.5) {
       this.state.won = true;
