@@ -2,6 +2,8 @@ import { Room, Client } from "@colyseus/core";
 import { Schema, MapSchema, ArraySchema, type } from "@colyseus/schema";
 
 // ─── Config ──────────────────────────────────────────────
+const START_ZONE = { x: 12, y: 8, width: 6, height: 4 }; // lobby "start box", in tile units
+const COUNTDOWN_SECONDS = 5;
 const GRID_WIDTH = 30;
 const GRID_HEIGHT = 20;
 const SHIP_SPAWN_COL = 1;
@@ -40,12 +42,15 @@ class Tile extends Schema {
 
 class GameState extends Schema {
   @type({ map: Player }) players = new MapSchema<Player>();
-  @type([Tile]) tiles = new ArraySchema<Tile>(); // flat array, index = y * GRID_WIDTH + x
+  @type([Tile]) tiles = new ArraySchema<Tile>();
 
-  @type("number") shipX: number = 0; // continuous world position, in tile units (can be fractional)
+  @type("string") phase: "lobby" | "countdown" | "playing" = "lobby";
+  @type("number") countdown: number = 0;
+
+  @type("number") shipX: number = 0;
   @type("number") shipY: number = 0;
   @type("string") shipFacing: Direction = "right";
-  @type("string") shipSignal: string = ""; // pending turn signal: "" | "up" | "down" | "left" | "right"
+  @type("string") shipSignal: string = "";
   @type("boolean") crashed: boolean = false;
   @type("boolean") won: boolean = false;
 
@@ -57,18 +62,83 @@ export class GameRoom extends Room {
   maxClients = 5;
   state = new GameState();
   private shipLoopHandle: any;
-  private lastTurnTime = 0; // timestamp (ms) of the last executed turn
-
+  private lobbyCheckHandle: any;
+  private countdownHandle: any;
+  private lastTurnTime = 0;
   onCreate() {
-    this.initGrid();
-    this.initShipAndDock();
     this.registerMessageHandlers();
-    this.startShipLoop();
-    this.lastTurnTime = this.clock.currentTime;
+    this.startLobbyCheck();
+  }
+  // ─── Setup ──────────────────────────────────────────────
+  private startLobbyCheck() {
+    this.lobbyCheckHandle = this.clock.setInterval(() => {
+      if (this.state.phase !== "lobby") return;
+
+      const playerList = Array.from(this.state.players.values());
+      if (playerList.length === 0) return; // don't start with an empty room
+
+      const allInZone = playerList.every((p) => this.isInStartZone(p.x, p.y));
+
+      if (allInZone) {
+        this.state.phase = "countdown";
+        this.state.countdown = COUNTDOWN_SECONDS;
+        this.startCountdown();
+      }
+    }, 200); // check 5x per second — frequent enough to feel responsive
   }
 
-  // ─── Setup ──────────────────────────────────────────────
+  private isInStartZone(x: number, y: number): boolean {
+    return (
+      x >= START_ZONE.x &&
+      x <= START_ZONE.x + START_ZONE.width &&
+      y >= START_ZONE.y &&
+      y <= START_ZONE.y + START_ZONE.height
+    );
+  }
 
+  private startCountdown() {
+    this.countdownHandle = this.clock.setInterval(() => {
+      // If anyone leaves the zone during countdown, cancel back to lobby
+      const playerList = Array.from(this.state.players.values());
+      const stillAllInZone = playerList.every((p) =>
+        this.isInStartZone(p.x, p.y),
+      );
+
+      if (!stillAllInZone) {
+        this.state.phase = "lobby";
+        this.state.countdown = 0;
+        this.countdownHandle?.clear();
+        return;
+      }
+
+      this.state.countdown -= 1;
+
+      if (this.state.countdown <= 0) {
+        this.countdownHandle?.clear();
+        this.startGame();
+      }
+    }, 1000);
+  }
+
+  private startGame() {
+    this.state.phase = "playing";
+
+    this.state.phase = "playing";
+    console.log(
+      "Starting game with players:",
+      Array.from(this.state.players.keys()),
+    );
+    this.lobbyCheckHandle?.clear();
+    this.initGrid();
+    this.initShipAndDock();
+    this.startShipLoop();
+
+    // Move players from the lobby zone to spawn near the ship's start
+    for (const player of this.state.players.values()) {
+      player.x = SHIP_SPAWN_COL;
+      player.y = Math.min(GRID_HEIGHT - 2, this.state.shipY + 2);
+    }
+  }
   private tileIndex(x: number, y: number): number {
     return y * GRID_WIDTH + x;
   }
@@ -120,9 +190,6 @@ export class GameRoom extends Room {
       (client, data: { x: number; y: number; facing: Direction }) => {
         const player = this.state.players.get(client.sessionId);
         if (!player) return;
-        // NOTE: client-authoritative position for now (same simplification as
-        // the earlier prototype) — server currently trusts the client's x/y.
-        // A hardening pass later would validate steps server-side instead.
         player.x = data.x;
         player.y = data.y;
         player.facing = data.facing;
@@ -131,6 +198,7 @@ export class GameRoom extends Room {
 
     // Dig: player faces a ground tile, not carrying anything -> becomes river, player now carries dirt
     this.onMessage("dig", (client) => {
+      if (this.state.phase !== "playing") return;
       const player = this.state.players.get(client.sessionId);
       if (!player || player.carrying) return;
 
@@ -143,17 +211,16 @@ export class GameRoom extends Room {
 
     // Dump: player carrying dirt, faces an empty tile (no pile already there)
     this.onMessage("dump", (client) => {
+      if (this.state.phase !== "playing") return;
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.carrying) return;
 
       const target = this.facingTile(player);
-      if (!target || target.hasDirtPile) return; // can't dump on existing pile
+      if (!target || target.hasDirtPile) return;
 
       if (target.terrain === "ground") {
-        // Design: dumping dirt onto ground creates a pile (new obstacle)
         target.hasDirtPile = true;
       } else if (target.terrain === "river") {
-        // Design: dumping dirt back into a dug river fills it back to ground
         target.terrain = "ground";
       }
       player.carrying = false;
@@ -161,6 +228,7 @@ export class GameRoom extends Room {
 
     // Pick up an existing dirt pile to relocate it
     this.onMessage("pickup", (client) => {
+      if (this.state.phase !== "playing") return;
       const player = this.state.players.get(client.sessionId);
       if (!player || player.carrying) return;
 
@@ -173,11 +241,12 @@ export class GameRoom extends Room {
 
     // Turn signal: only perpendicular turns are valid; opposite direction rejected
     this.onMessage("signal", (client, data: { direction: Direction }) => {
+      if (this.state.phase !== "playing") return;
       const requested = data.direction;
       const current = this.state.shipFacing as Direction;
 
-      if (requested === current) return; // already going that way, no-op
-      if (requested === OPPOSITE[current]) return; // design rule: can't signal a reverse
+      if (requested === current) return;
+      if (requested === OPPOSITE[current]) return;
 
       this.state.shipSignal = requested;
     });
@@ -277,9 +346,9 @@ export class GameRoom extends Room {
   onJoin(client: Client, options: { name?: string }) {
     const player = new Player();
     player.name = options?.name || `Player-${client.sessionId.slice(0, 4)}`;
-    // Spawn players near the ship's start so they're not lost in a big empty grid
-    player.x = SHIP_SPAWN_COL;
-    player.y = Math.min(GRID_HEIGHT - 2, this.state.shipY + 2);
+    // Spawn somewhere near the start zone so players can walk in easily
+    player.x = START_ZONE.x - 2;
+    player.y = START_ZONE.y + START_ZONE.height / 2;
     this.state.players.set(client.sessionId, player);
   }
 
@@ -289,5 +358,7 @@ export class GameRoom extends Room {
 
   onDispose() {
     this.shipLoopHandle?.clear();
+    this.lobbyCheckHandle?.clear();
+    this.countdownHandle?.clear();
   }
 }

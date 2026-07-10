@@ -44,8 +44,14 @@ export class MainScene extends Phaser.Scene {
   constructor() {
     super("MainScene");
   }
+  private passedRoom?: Room;
+
+  init(data: { room: Room }) {
+    this.passedRoom = data.room;
+  }
 
   async create() {
+    console.log("MainScene create() called");
     // Background
     // this.add.rectangle(
     //   (GRID_WIDTH * TILE_SIZE) / 2,
@@ -111,8 +117,7 @@ export class MainScene extends Phaser.Scene {
       }
     }
 
-    const client = new Client("ws://localhost:2567");
-    this.room = await client.joinOrCreate("game_room", { name: "Player" });
+    this.room = this.passedRoom!;
     this.mySessionId = this.room.sessionId;
 
     const $ = getStateCallbacks(this.room);
@@ -168,6 +173,14 @@ export class MainScene extends Phaser.Scene {
 
     // Players
     $(this.room.state).players.onAdd((player, sessionId) => {
+      console.log(
+        "players.onAdd fired. sessionId:",
+        sessionId,
+        "mySessionId:",
+        this.mySessionId,
+        "match:",
+        sessionId === this.mySessionId,
+      );
       const color = sessionId === this.mySessionId ? 0xffc400 : 0xffff00;
       const rect = this.add.rectangle(
         player.x * TILE_SIZE + TILE_SIZE / 2,
