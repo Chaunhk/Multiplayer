@@ -26,7 +26,7 @@ export class MainScene extends Phaser.Scene {
   private remotePlayers: Map<string, Phaser.GameObjects.Rectangle> = new Map();
   private tileRects: Phaser.GameObjects.Rectangle[] = []; // index = y * GRID_WIDTH + x
   private dirtPileMarkers: Phaser.GameObjects.Arc[] = [];
-  private ship!: Phaser.GameObjects.Triangle;
+  private ship!: Phaser.GameObjects.Text;
   private dockMarker!: Phaser.GameObjects.Star;
   private gridContainer!: Phaser.GameObjects.Container;
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -126,7 +126,9 @@ export class MainScene extends Phaser.Scene {
     });
 
     // Ship — a triangle pointing in its facing direction
-    this.ship = this.add.triangle(0, 0, 0, 12, 12, -12, -12, -12, 0x00ffff);
+    this.ship = this.add
+      .text(0, 0, "🚢", { fontSize: `${TILE_SIZE}px` })
+      .setOrigin(0.5);
     this.gridContainer.add(this.ship);
     $(this.room.state).listen(
       "shipX",
@@ -157,7 +159,7 @@ export class MainScene extends Phaser.Scene {
     $(this.room.state).listen("crashed", (v: boolean) => {
       if (v) {
         this.statusText.setText("💥 SHIP CRASHED! Game Over.");
-        this.ship.setFillStyle(0xff0000);
+        this.ship.setText("💥");
       }
     });
     $(this.room.state).listen("won", (v: boolean) => {
@@ -223,13 +225,27 @@ export class MainScene extends Phaser.Scene {
   }
 
   private rotateShip(facing: Direction) {
-    const angles: Record<Direction, number> = {
-      right: 0,
-      down: 90,
-      left: 180,
-      up: 270,
-    };
-    this.ship.setAngle(angles[facing]);
+    // The 🚢 emoji visually faces left by default, so we flip/rotate
+    // differently per direction rather than just rotating 0-360,
+    // which would render the boat upside-down for some directions.
+    switch (facing) {
+      case "left":
+        this.ship.setAngle(0);
+        this.ship.setFlipX(false);
+        break;
+      case "right":
+        this.ship.setAngle(0);
+        this.ship.setFlipX(true);
+        break;
+      case "up":
+        this.ship.setAngle(-90);
+        this.ship.setFlipX(true);
+        break;
+      case "down":
+        this.ship.setAngle(90);
+        this.ship.setFlipX(true);
+        break;
+    }
   }
 
   private updateTileVisual(

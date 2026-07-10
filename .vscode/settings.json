@@ -1,5 +1,5 @@
 {
   "terminal.integrated.env.windows": {
-    "PATH": "${workspaceFolder}\\..\\..\\node-v24.18.0-win-x64;${env:PATH}"
+    "PATH": "C:\\totally-fake-path-xyz;${env:PATH}"
   }
 }

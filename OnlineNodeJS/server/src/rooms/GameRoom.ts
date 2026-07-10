@@ -7,7 +7,7 @@ const GRID_HEIGHT = 20;
 const SHIP_SPAWN_COL = 1;
 const DOCK_COL = GRID_WIDTH - 2; // column 28
 const SHIP_SPEED = 0.5 / 1.5; // tiles per second (1 tile every 1.5s)
-
+const TURN_COOLDOWN_MS = 5000;
 type Direction = "up" | "down" | "left" | "right";
 const OPPOSITE: Record<Direction, Direction> = {
   up: "down",
@@ -54,15 +54,17 @@ class GameState extends Schema {
 }
 
 export class GameRoom extends Room {
-  maxClients = 5; // design: up to 5 players
+  maxClients = 5;
   state = new GameState();
   private shipLoopHandle: any;
+  private lastTurnTime = 0; // timestamp (ms) of the last executed turn
 
   onCreate() {
     this.initGrid();
     this.initShipAndDock();
     this.registerMessageHandlers();
     this.startShipLoop();
+    this.lastTurnTime = this.clock.currentTime;
   }
 
   // ─── Setup ──────────────────────────────────────────────
@@ -237,10 +239,16 @@ export class GameRoom extends Room {
         Math.abs(this.state.shipX - Math.round(this.state.shipX)) < 0.05 &&
         Math.abs(this.state.shipY - Math.round(this.state.shipY)) < 0.05;
 
-      if (signalTile && signalTile.terrain === "river" && nearCenter) {
+      const cooldownElapsed =
+        this.clock.currentTime - this.lastTurnTime >= TURN_COOLDOWN_MS;
+
+      if (signalTile && signalTile.terrain === "river" && cooldownElapsed) {
+        this.state.shipX = currentTileX;
+        this.state.shipY = currentTileY;
         this.state.shipFacing = signalDir;
         this.state.shipSignal = "";
-        return; // turned this tick; move normally next tick
+        this.lastTurnTime = this.clock.currentTime;
+        return;
       }
     }
 
