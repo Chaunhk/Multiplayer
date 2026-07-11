@@ -8,7 +8,7 @@ const CANVAS_HEIGHT = 600;
 // Must match server's START_ZONE (in tile units)
 const START_ZONE = { x: 12, y: 8, width: 6, height: 4 };
 
-type Direction = "up" | "down" | "left" | "right";
+//type Direction = "up" | "down" | "left" | "right";
 
 export class LobbyScene extends Phaser.Scene {
   private room!: Room;
@@ -71,7 +71,7 @@ export class LobbyScene extends Phaser.Scene {
     this.sKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.S);
     this.dKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.D);
 
-    const client = new Client("ws://192.168.1.229:2567");
+    const client = new Client(`ws://${window.location.hostname}:2567`);
     this.room = await client.joinOrCreate("game_room", { name: "Player" });
     this.mySessionId = this.room.sessionId;
 
